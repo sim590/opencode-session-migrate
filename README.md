@@ -39,7 +39,7 @@ Pin the exact version. OpenCode only checks *unpinned* packages for updates and 
 ### CLI plugin
 
 ```sh
-opencode plugin add opencode-session-migrate
+opencode plugin add github:sim590/opencode-session-migrate
 ```
 
 Alternatively, add the package to `cli.json` (global config at `~/.config/opencode/cli.json`, or `$XDG_CONFIG_HOME/opencode/cli.json`):
