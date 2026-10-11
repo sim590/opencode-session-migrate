@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/cli.json",
+  "plugins": [
+    {
+      "package": "opencode-session-migrate",
+      "options": {
+        "enabled": true,
+        "keybind": "alt+m",
+        "debug": false
+      }
+    }
+  ]
+}

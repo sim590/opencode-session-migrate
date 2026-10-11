@@ -1,302 +1,210 @@
-/** @jsxImportSource @opentui/solid */
-import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { Show } from "solid-js"
-import { Database } from "bun:sqlite"
+import { Plugin } from "@opencode/plugin/tui"
+import type { Project, SessionInfo } from "@opencode/client"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { xdgData } from "xdg-basedir"
 
 const GLOBAL_PROJECT = "global"
 const LOG_FILE = "/tmp/opencode-session-migrate.log"
+type PluginContext = Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0]
 
 let debug = false
 
-function debugLog(...args: unknown[]) {
+function debugLog(...args: unknown[]): void {
   if (!debug) return
-  const line = args.map((a) => (typeof a === "string" ? a : formatError(a))).join(" ")
+  const line = args.map((value) => (typeof value === "string" ? value : formatError(value))).join(" ")
   try {
     fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${line}\n`)
   } catch {
-    // best-effort logging, never crash the plugin
+    // Best-effort logging; never crash the plugin.
   }
 }
 
-function formatError(e: unknown): string {
-  if (e instanceof Error) return e.stack ?? e.message
-  return JSON.stringify(e)
-}
-
-type SessionInfo = {
-  id: string
-  title: string
-  directory: string
-  projectID: string
-  parentID?: string
-  time: { updated: number }
-}
-
-type ProjectInfo = {
-  id: string
-  name?: string
-  worktree: string
-}
-
-type Destination = {
-  projectID: string
-  directory: string
-}
-
-function dataDir(): string {
-  return path.join(xdgData ?? path.join(os.homedir(), ".local", "share"), "opencode")
-}
-
-function dbPath(): string {
-  const env = process.env.OPENCODE_DB
-  if (env && env !== ":memory:") {
-    return path.isAbsolute(env) ? env : path.join(dataDir(), env)
-  }
-  return path.join(dataDir(), "opencode.db")
-}
-
-function isOrphan(session: SessionInfo, projects: ProjectInfo[]): boolean {
-  if (!session.directory || !fs.existsSync(session.directory)) return true
-  if (session.projectID === GLOBAL_PROJECT) {
-    return projects.some(
-      (p) =>
-        p.id !== GLOBAL_PROJECT &&
-        p.worktree !== "/" &&
-        (session.directory === p.worktree || session.directory.startsWith(p.worktree + path.sep)),
-    )
-  }
-  return false
-}
-
-// Converts a filesystem path to OpenCode's on-disk storage form. OpenCode's
-// path type stores forward slashes even on Windows (e.g. "C:/foo/bar"), but
-// raw filesystem paths on win32 use backslashes ("C:\foo\bar"). Direct SQLite
-// writes bypass OpenCode's path type, so we must normalize here to match what
-// /sessions compares against. No-op on non-win32 platforms.
-export function toStoragePath(p: string, platform: NodeJS.Platform = process.platform): string {
-  if (platform !== "win32") return p
-  return p.replace(/\\/g, "/")
-}
-
-function migrate(sessionID: string, projectID: string, directory: string): void {
-  const storageDirectory = toStoragePath(directory)
-  const db = new Database(dbPath(), { readwrite: true })
+function formatError(error: unknown): string {
+  if (error instanceof Error) return error.stack ?? error.message
   try {
-    const set = "project_id = ?, directory = ?, path = NULL, workspace_id = NULL"
-    const update = db.prepare(`UPDATE session SET ${set} WHERE id = ?`)
-    const updateChildren = db.prepare(`UPDATE session SET ${set} WHERE parent_id = ?`)
-    db.transaction(() => {
-      update.run(projectID, storageDirectory, sessionID)
-      updateChildren.run(projectID, storageDirectory, sessionID)
-    })()
-  } finally {
-    db.close()
+    return JSON.stringify(error) ?? String(error)
+  } catch {
+    return String(error)
   }
 }
 
-function formatTime(ts: number): string {
-  return new Date(ts).toLocaleString()
+function formatTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleString()
 }
 
-function loadingBox(message: string) {
-  return (
-    <box paddingLeft={2} paddingTop={1}>
-      <text>{message}</text>
-    </box>
-  )
+function isOrphan(session: SessionInfo, projects: Project[]): boolean {
+  const directory = session.location?.directory
+  if (!directory || !fs.existsSync(directory)) return true
+  if (session.projectID !== GLOBAL_PROJECT) return false
+
+  return projects.some((project) => {
+    const canonical = project.canonical
+    return canonical !== "/" && (directory === canonical || directory.startsWith(canonical + path.sep))
+  })
 }
 
-async function openMigrateDialog(api: TuiPluginApi) {
+async function loadAllSessions(context: PluginContext): Promise<SessionInfo[]> {
+  const sessions: SessionInfo[] = []
+  let cursor: string | undefined
+
+  for (let iteration = 0; iteration < 50; iteration++) {
+    const result = await context.client.session.list({ limit: 200, cursor })
+    sessions.push(...result.data)
+    cursor = result.cursor.next ?? undefined
+    if (!cursor) break
+  }
+
+  return sessions
+}
+
+async function openMigrateDialog(context: PluginContext): Promise<void> {
   debugLog("openMigrateDialog: start")
-  api.ui.dialog.setSize("large")
-  api.ui.dialog.replace(() => loadingBox("Loading sessions..."))
 
   try {
-    debugLog("openMigrateDialog: fetching sessions + projects")
-    const [sessionsRes, projectsRes] = await Promise.all([
-      // Empty directory stops the SDK from injecting the cwd and filtering
-      // to the current project's sessions.
-      api.client.experimental.session.list({ roots: true, limit: 200, directory: "" }),
-      api.client.project.list(),
+    const [sessions, projects] = await Promise.all([
+      loadAllSessions(context),
+      context.client.project.list(),
     ])
-    const sessions = (sessionsRes.data ?? []) as SessionInfo[]
-    const projects = (projectsRes.data ?? []) as ProjectInfo[]
     debugLog(`openMigrateDialog: sessions=${sessions.length} projects=${projects.length}`)
 
-    const orphans = new Set(sessions.filter((s) => isOrphan(s, projects)).map((s) => s.id))
-    const projectNames = new Map(projects.map((p) => [p.id, p.name ?? p.worktree]))
-    debugLog(`openMigrateDialog: orphans=${orphans.size} dbPath=${dbPath()}`)
+    const projectNames = new Map(projects.map((project) => [project.id, project.name || project.canonical]))
+    const orphans = new Set(sessions.filter((session) => isOrphan(session, projects)).map((session) => session.id))
 
-    api.ui.dialog.replace(() => (
-      <DialogSessionMigrate api={api} sessions={sessions} orphans={orphans} projectNames={projectNames} />
-    ))
+    const selectedID = await context.ui.dialog.select({
+      title: "Migrate Session",
+      placeholder: "Search sessions",
+      options: sessions.map((session) => ({
+        title: `${orphans.has(session.id) ? "! " : ""}${session.title ?? session.id}`,
+        value: session.id,
+        description: session.location.directory,
+        footer: formatTime(session.time.updated),
+        category: projectNames.get(session.projectID) ?? session.projectID,
+      })),
+    })
+    if (selectedID === undefined) return
+
+    const session = sessions.find((item) => item.id === selectedID)
+    if (!session) return
+
+    const locationDirectory = context.location?.directory
+    let current: Project | undefined
+    try {
+      const location = locationDirectory
+        ? await context.client.location.get({ location: { directory: locationDirectory } })
+        : await context.client.location.get()
+      current = projects.find((project) => project.id === location.project.id)
+    } catch (error) {
+      debugLog("openMigrateDialog: failed to resolve current project", error)
+    }
+    if (!current && locationDirectory) {
+      current = projects.find((project) => project.canonical === locationDirectory)
+    }
+
+    const currentDestination = current
+      ? {
+          title: current.name || current.canonical,
+          value: { directory: locationDirectory ?? current.canonical },
+          description: locationDirectory ?? current.canonical,
+          category: "Current",
+        }
+      : undefined
+
+    const destinations: Array<{ title: string; value: { directory: string }; description?: string; category?: string }> = [
+      ...(currentDestination ? [currentDestination] : []),
+      {
+        title: "Home (~)",
+        value: { directory: os.homedir() },
+        description: os.homedir(),
+        category: "Special",
+      },
+      ...projects
+        .filter((project) => project.id !== current?.id && project.id !== GLOBAL_PROJECT)
+        .map((project) => ({
+          title: project.name || project.canonical,
+          value: { directory: project.canonical },
+          description: project.canonical,
+          category: "Projects",
+        })),
+    ]
+
+    const destination = await context.ui.dialog.select({
+      title: `Migrate: ${session.title ?? session.id}`,
+      placeholder: "Choose destination",
+      options: destinations,
+    })
+    if (!destination) return
+
+    const children = new Map<string, SessionInfo[]>()
+    for (const candidate of sessions) {
+      if (!candidate.parentID) continue
+      const siblings = children.get(candidate.parentID) ?? []
+      siblings.push(candidate)
+      children.set(candidate.parentID, siblings)
+    }
+
+    const ordered: SessionInfo[] = []
+    const visited = new Set<string>()
+    const visit = (parent: SessionInfo): void => {
+      if (visited.has(parent.id)) return
+      visited.add(parent.id)
+      ordered.push(parent)
+      for (const child of children.get(parent.id) ?? []) visit(child)
+    }
+    visit(session)
+
+    try {
+      for (const item of ordered) {
+        await context.client.session.move({ sessionID: item.id, directory: destination.directory })
+      }
+    } catch (error) {
+      debugLog("migration failed", error)
+      context.ui.toast.show({ variant: "error", title: "Migration failed", message: formatError(error) })
+      return
+    }
+
+    for (const item of ordered) context.data.session.invalidate(item.id)
+    context.data.project.invalidate()
+    context.ui.toast.show({
+      variant: "success",
+      title: "Migration complete",
+      message: `Moved ${ordered.length} session${ordered.length === 1 ? "" : "s"} to ${destination.directory}`,
+    })
+    debugLog(`migration complete: ${ordered.map((item) => item.id).join(",")}`)
+    await openMigrateDialog(context)
   } catch (error) {
     debugLog("openMigrateDialog: error", error)
-    api.ui.dialog.replace(() => loadingBox("Failed to load sessions"))
+    context.ui.toast.show({ variant: "error", title: "Migration failed", message: formatError(error) })
   }
 }
 
-function DialogSessionMigrate(props: {
-  api: TuiPluginApi
-  sessions: SessionInfo[]
-  orphans: Set<string>
-  projectNames: Map<string, string>
-}) {
-  const api = props.api
-  const DialogSelect = api.ui.DialogSelect
-  const theme = api.theme.current
-
-  const options = props.sessions.map((s) => ({
-    title: s.title,
-    value: s.id,
-    description: s.directory,
-    footer: formatTime(s.time.updated),
-    category: props.projectNames.get(s.projectID) ?? s.projectID,
-    gutter: props.orphans.has(s.id) ? () => <text fg={theme.warning}>!</text> : undefined,
-  }))
-
-  return (
-    <box>
-      <DialogSelect
-        title="Migrate Session"
-        placeholder="Search sessions"
-        options={options}
-        onSelect={(option) => {
-          debugLog("DialogSessionMigrate.onSelect:", option.value)
-          const session = props.sessions.find((s) => s.id === option.value)
-          if (!session) return
-          void openRescueDialog(api, session)
-        }}
-      />
-      <Show when={props.orphans.size > 0}>
-        <box paddingLeft={4} paddingRight={4} paddingBottom={1}>
-          <text fg={theme.textMuted}>
-            NOTE: <span style={{ fg: theme.warning }}>!</span> means the session is orphan
-          </text>
-        </box>
-      </Show>
-    </box>
-  )
-}
-
-async function openRescueDialog(api: TuiPluginApi, session: SessionInfo) {
-  debugLog("openRescueDialog: start", session.id)
-  api.ui.dialog.setSize("large")
-  api.ui.dialog.replace(() => loadingBox("Loading projects..."))
-
-  try {
-    debugLog("openRescueDialog: fetching current + list")
-    const [cur, all] = await Promise.all([api.client.project.current(), api.client.project.list()])
-    const current = cur.data as ProjectInfo | undefined
-    const projects = (all.data ?? []) as ProjectInfo[]
-    debugLog(`openRescueDialog: current=${current?.id} projects=${projects.length}`)
-
-    api.ui.dialog.replace(() => (
-      <DialogSessionRescue api={api} session={session} current={current} projects={projects} />
-    ))
-  } catch (error) {
-    debugLog("openRescueDialog: error", error)
-    api.ui.dialog.replace(() => loadingBox("Failed to load projects"))
-  }
-}
-
-function DialogSessionRescue(props: {
-  api: TuiPluginApi
-  session: SessionInfo
-  current: ProjectInfo | undefined
-  projects: ProjectInfo[]
-}) {
-  const api = props.api
-  const DialogSelect = api.ui.DialogSelect
-
-  const options: Array<{
-    title: string
-    value: Destination
-    description: string
-    category: string
-  }> = []
-
-  if (props.current) {
-    const dir = api.state.path.directory || props.current.worktree
-    options.push({
-      title: props.current.name ?? props.current.worktree,
-      value: { projectID: props.current.id, directory: dir },
-      description: dir,
-      category: "Current",
-    })
-  }
-
-  options.push({
-    title: "Home (~)",
-    value: { projectID: GLOBAL_PROJECT, directory: os.homedir() },
-    description: os.homedir(),
-    category: "Special",
-  })
-
-  for (const p of props.projects) {
-    if (p.id === props.current?.id) continue
-    if (p.id === GLOBAL_PROJECT) continue
-    options.push({
-      title: p.name ?? p.worktree,
-      value: { projectID: p.id, directory: p.worktree },
-      description: p.worktree,
-      category: "Projects",
-    })
-  }
-
-  return (
-    <DialogSelect
-      title={`Migrate: ${props.session.title}`}
-      placeholder="Choose destination"
-      options={options}
-      onSelect={(option) => {
-        debugLog("DialogSessionRescue.onSelect:", option.value.projectID, option.value.directory)
-        try {
-          migrate(props.session.id, option.value.projectID, option.value.directory)
-          debugLog("migrate: success")
-        } catch (error) {
-          debugLog("migrate: error", error)
-          api.ui.toast({ variant: "error", title: "Migration failed", message: formatError(error) })
-          return
-        }
-        void openMigrateDialog(api)
-      }}
-    />
-  )
-}
-
-const tui: TuiPlugin = async (api, options, meta) => {
-  if (options?.enabled === false) return
-
-  debug = options?.debug === true
-  const key = typeof options?.keybind === "string" ? options.keybind : "ctrl+o"
-  debugLog("plugin: init", `keybind=${key}`)
-
-  api.keymap.registerLayer({
-    commands: [
-      {
-        name: "session_migrate",
-        title: "Migrate sessions",
-        category: "Plugin",
-        namespace: "palette",
-        slashName: "migrate",
-        run() {
-          debugLog("command: session_migrate triggered")
-          void openMigrateDialog(api)
-        },
-      },
-    ],
-    bindings: [{ key, cmd: "session_migrate", desc: "Migrate sessions" }],
-  })
-}
-
-const plugin: TuiPluginModule & { id: string } = {
+export default Plugin.define({
   id: "session-migrate",
-  tui,
-}
+  setup(context) {
+    if (context.options.enabled === false) return
 
-export default plugin
+    debug = context.options.debug === true
+    const key = typeof context.options.keybind === "string" ? context.options.keybind : "alt+m"
+    debugLog("plugin: init", `keybind=${key}`)
+
+    context.keymap.layer(() => ({
+      mode: "global",
+      priority: 10,
+      commands: [
+        {
+          id: "session-migrate.open",
+          title: "Migrate sessions",
+          group: "Plugin",
+          bind: key,
+          palette: true,
+          slash: { name: "migrate" },
+          run: () => {
+            debugLog("command: session-migrate.open triggered")
+            void openMigrateDialog(context)
+          },
+        },
+      ],
+      bindings: ["session-migrate.open"],
+    }))
+  },
+})
