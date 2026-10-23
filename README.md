@@ -2,6 +2,10 @@
 
 A [opencode](https://opencode.ai) TUI plugin to migrate sessions between projects and rescue orphaned sessions.
 
+## DEVELOPMENT STOPPED
+
+Version 2.0 of opencode introduced `/cd` command and lets the users retrieve all their sessions from all projects within the session dialog using `ctrl-a`. This pluing is now redered obsolete and will no longer be maintained. It is still available for download, but it may not work with future versions of opencode.
+
 ## Features
 
 - List sessions across **all** projects, not just the current one.
